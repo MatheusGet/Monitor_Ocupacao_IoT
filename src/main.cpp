@@ -2,6 +2,62 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include "secrets.h"
+
+///////////////////////////////////////////////////////////////// DEFINIÇÃO DOS PINOS DO SENSOR HCSR04 ////////////////////////////////////////////////////////////////////////////////////////////////////////
+// SENSOR 1
+#define TRIG1 23
+#define ECHO1 18
+
+// SENSOR 2
+#define TRIG2 22
+#define ECHO2 19
+
+// SENSOR 3
+#define TRIG3 21
+#define ECHO3 15
+
+///////////////////////////////////////////////////////////// ESTRUTURA DE DADOS DOS SENSORES /////////////////////////////////////////////////////////////
+struct Sensor
+{
+    int numero;
+    int trig;
+    int echo;
+
+    float leituras[5];
+    int indiceLeitura = 0;
+    int quantidadeLeituras = 0;
+
+    float distanciaFiltrada = 0;
+    bool filtroPronto = false;
+
+    bool ocupado = false;
+
+    int contadorOcupado = 0;
+    int contadorLivre = 0;
+
+    bool estadoAnterior = false;
+};
+
+// INSTÂNCIAS DOS TRÊS SENSORES
+Sensor sensor1;
+Sensor sensor2;
+Sensor sensor3;
+
+//////////////////////////////////////////// CONFIGURAÇÃO DOS PINOS DE CADA SENSOR ////////////////////////////////////////////
+void configurarSensores()
+{
+    sensor1.numero = 1;
+    sensor1.trig = TRIG1;
+    sensor1.echo = ECHO1;
+
+    sensor2.numero = 2;
+    sensor2.trig = TRIG2;
+    sensor2.echo = ECHO2;
+
+    sensor3.numero = 3;
+    sensor3.trig = TRIG3;
+    sensor3.echo = ECHO3;
+}
 ////////////////////////////////////////////////////////// BLOCO DE VARIÁVEIS GLOBAIS ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 unsigned long ultimaLeitura = 0; // Responsável por armazenar o tempo da última leitura do sensor HCSR04
@@ -10,32 +66,25 @@ unsigned long ultimaPublicacao = 0; // Responsável por armazenar o tempo da úl
 unsigned long ultimaTentativaMQTT = 0; // Responsável por armazenar o tempo da última tentativa de conexão MQTT
 const unsigned long intervaloReconexaoMQTT = 5000; // Tempo por tentativa de reconexão MQTT (5 segundos)
 
-float leituras[5]; // Vetor que armazena as últimas 5 leituras válidas do sensor HCSR04
-int indiceLeitura = 0; // Índice que indica a posição atual no vetor de leituras
-int quantidadeLeituras = 0; // Contador que indica quantas leituras válidas foram armazenadas no vetor (máximo de 5)
-
 // Nossas funções
-void lerDistancia(); // Função que realiza a leitura do sensor HCSR04 e armazena no vetor de leituras
+void lerDistancia(Sensor &sensor); // Função que realiza a leitura do sensor HCSR04 e armazena no vetor de leituras
 void ordenarLeituras(float vetor[]); // Função que ordena o vetor de leituras válidas utilizando o algoritmo Bubble Sort
-float calcularMediana(); // Função que calcula a mediana das últimas 5 leituras válidas do sensor HCSR04
-void verificarOcupacao(); // Função que verifica se o espaço está ocupado ou livre com base na distância filtrada
+float calcularMediana(Sensor &sensor); // Função que calcula a mediana das últimas 5 leituras válidas do sensor HCSR04
+void verificarOcupacao(Sensor &sensor); // Função que verifica se o espaço está ocupado ou livre com base na distância filtrada
 void conectarWiFi(); // Função que realiza a conexão do ESP32 à rede Wi-Fi
 void conectarMQTT(); // Função que realiza a conexão do ESP32 ao broker MQTT e publica o status online/offline
 bool publicarMQTT(); // Função que publica os dados de ocupação no broker MQTT
 
-float distanciaFiltrada = 0; // Variável global que armazena a distância filtrada (mediana) das últimas 5 leituras válidas do sensor HCSR04
-bool filtroPronto = false; // Variável global que indica se o filtro de mediana está pronto (ou seja, se já foram feitas 5 leituras válidas)
 bool publicacaoPendente = false; // Variável global que indica se há uma publicação pendente no broker MQTT
 
 // CONTROLE DO ESTADO DE OCUPAÇÃO
-bool ocupado = false; // estado atual do espaço.
 
-int contadorOcupado = 0; // confirmações consecutivas de ocupação.
-int contadorLivre = 0; // confirmações consecutivas de liberação.
 float limiteOcupado = 30.0; // limite inferior de distância.
 float limiteLivre = 35.0; // limite superior de distância.
-bool estadoAnterior = false;
 
+// CONTROLE DE LEITURA DOS TRÊS SENSORES
+int proximoSensor = 0;
+const unsigned long intervaloLeituraSensor = 166;
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////// CONFIGURAÇÕES WI-FI E MQTT ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // CONFIGURAÇÕES WI-FI
@@ -53,81 +102,82 @@ const char* topicoStatus = "inatel/esp32/status";
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-///////////////////////////////////////////////////////////////// DEFINIÇÃO DOS PINOS DO SENSOR HCSR04 ////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#define TRIG 23 
-#define ECHO 18
-
-////////////////////////////////////////////////////////// FUNÇÕES DE LEITURA DO SENSOR /////////////////////////////////////////
-void lerDistancia()
+//////////////////////////////////////////////////////////////// FUNÇÃO PARA LER A DISTÂNCIA DO SENSOR HCSR04 ////////////////////////////////////////////////////////////////////////////////////////////////////////
+void lerDistancia(Sensor &sensor)
 {
-digitalWrite(TRIG, LOW);
-delayMicroseconds(2);
+    // Disparo do sensor ultrassônico
+    digitalWrite(sensor.trig, LOW);
+    delayMicroseconds(2);
 
-digitalWrite(TRIG, HIGH);
-delayMicroseconds(10);
+    digitalWrite(sensor.trig, HIGH);
+    delayMicroseconds(10);
 
-digitalWrite(TRIG, LOW);
+    digitalWrite(sensor.trig, LOW);
 
-unsigned long duracao = pulseIn(ECHO, HIGH, 30000); // Emissão do pulso e medição do tempo de retorno do eco (em microsegundos)
+    // Medição do tempo de retorno do eco
+    unsigned long duracao = pulseIn(sensor.echo, HIGH, 30000);
 
-if (duracao == 0)
-{
-    Serial.println("Nenhum eco recebido!");
-    return;
-}
+    if (duracao == 0)
+    {
+        Serial.println("Nenhum eco recebido!");
+        return;
+    }
 
-float distanciaCm = (duracao * 0.0343) / 2; // Calcula a distância em centímetros (velocidade do som = 343 m/s)
+    // Cálculo da distância em centímetros
+    float distanciaCm = (duracao * 0.0343) / 2;
 
-// Armazenamento da leitura no vetor
-leituras[indiceLeitura] = distanciaCm;
-indiceLeitura++;
+    // Armazenamento da leitura no vetor do sensor
+    sensor.leituras[sensor.indiceLeitura] = distanciaCm;
+    sensor.indiceLeitura++;
 
-if (quantidadeLeituras < 5)
-{
-    quantidadeLeituras++;
-}
+    if (sensor.quantidadeLeituras < 5)
+    {
+        sensor.quantidadeLeituras++;
+    }
 
-filtroPronto = (quantidadeLeituras == 5);
+    sensor.filtroPronto = (sensor.quantidadeLeituras == 5);
 
-if (indiceLeitura >= 5)
-{
-    indiceLeitura = 0;
-}
+    if (sensor.indiceLeitura >= 5)
+    {
+        sensor.indiceLeitura = 0;
+    }
 
-// Distancia no monitor serial individual
-Serial.print("Distancia: ");
-Serial.print(distanciaCm);
-Serial.println(" cm");
-
-// Distancia filtrada no monitor serial
-if (filtroPronto)
-{
-    distanciaFiltrada = calcularMediana();
-
-    Serial.print("Distancia filtrada: ");
-    Serial.print(distanciaFiltrada);
+    // Distância no monitor serial
+    Serial.print("Sensor ");
+    Serial.print(sensor.numero);
+    Serial.print(" - Distancia: ");
+    Serial.print(distanciaCm);
     Serial.println(" cm");
 
-    verificarOcupacao();
-
-if (ocupado != estadoAnterior)
-{
-    if (ocupado)
+    // Processamento da distância filtrada
+    if (sensor.filtroPronto)
     {
-        Serial.println("Estado: OCUPADO");
+        sensor.distanciaFiltrada = calcularMediana(sensor);
+
+        Serial.print("Sensor ");
+        Serial.print(sensor.numero);
+        Serial.print(" - Distancia filtrada: ");
+        Serial.print(sensor.distanciaFiltrada);
+        Serial.println(" cm");
+
+        verificarOcupacao(sensor);
+    }
+
+    // Verificação de mudança no estado de ocupação
+    if (sensor.ocupado)
+    {
+        Serial.print("Sensor ");
+        Serial.print(sensor.numero);
+        Serial.println(" - Estado: OCUPADO");
     }
     else
     {
-        Serial.println("Estado: LIVRE");
+        Serial.print("Sensor ");
+        Serial.print(sensor.numero);
+        Serial.println(" - Estado: LIVRE");
     }
+}
 
-    publicacaoPendente = true;
-
-    estadoAnterior = ocupado;
-}
-}
-}
 
 /////////////////////////// FUNÇÃO BUBBLESORT PARA ORDENAR O VETOR DAS LEITUAS VALIDAS ///////////////////////////////////
 void ordenarLeituras(float vetor[])
@@ -149,13 +199,13 @@ void ordenarLeituras(float vetor[])
 }
 
 /////////////////////////////////// FUNÇÃO PARA CALCULAR A MEDIANA /////////////////////////////////////////
-float calcularMediana()
+float calcularMediana(Sensor &sensor)
 {
     float copiaLeituras[5];
 
     for (int i = 0; i < 5; i++)
     {
-        copiaLeituras[i] = leituras[i];
+        copiaLeituras[i] = sensor.leituras[i];
     }
 
     ordenarLeituras(copiaLeituras);
@@ -164,49 +214,50 @@ float calcularMediana()
 }
 
 ///////////////////////////////////////////// FUNÇÃO PARA VERIFICAR A OCUPAÇÃO /////////////////////////////////////
-void verificarOcupacao()
+void verificarOcupacao(Sensor &sensor)
 {
-    if (!ocupado)
+    if (!sensor.ocupado)
     {
         // Verifica se existe uma possível ocupação
-        if (distanciaFiltrada < limiteOcupado)
+        if (sensor.distanciaFiltrada < limiteOcupado)
         {
-            contadorOcupado++;
+            sensor.contadorOcupado++;
         }
         else
         {
-            contadorOcupado = 0;
+            sensor.contadorOcupado = 0;
         }
 
         // Confirma a ocupação após 3 leituras consecutivas
-        if (contadorOcupado >= 3)
+        if (sensor.contadorOcupado >= 3)
         {
-            ocupado = true;
-            contadorOcupado = 0;
-            contadorLivre = 0;
+            sensor.ocupado = true;
+            sensor.contadorOcupado = 0;
+            sensor.contadorLivre = 0;
         }
     }
     else
     {
         // Verifica se existe uma possível liberação
-        if (distanciaFiltrada > limiteLivre)
+        if (sensor.distanciaFiltrada > limiteLivre)
         {
-            contadorLivre++;
+            sensor.contadorLivre++;
         }
         else
         {
-            contadorLivre = 0;
+            sensor.contadorLivre = 0;
         }
 
         // Confirma a liberação após 3 leituras consecutivas
-        if (contadorLivre >= 3)
+        if (sensor.contadorLivre >= 3)
         {
-            ocupado = false;
-            contadorLivre = 0;
-            contadorOcupado = 0;
+            sensor.ocupado = false;
+            sensor.contadorLivre = 0;
+            sensor.contadorOcupado = 0;
         }
     }
 }
+
 
 //////////////////////////////////////////////////// FUNÇÃO PARA CONECTAR AO WI-FI ///////////////////////////////////
 void conectarWiFi()
@@ -259,21 +310,37 @@ void conectarMQTT()
     }
 }
 
-//////////////////////////////////// FUNÇÃO PARA PUBLICAR DADOS VIA MQTT ////////////////////////////////
+/////////////////////////////////////////////////////////////// FUNÇÃO PARA PUBLICAR OS DADOS NO BROKER MQTT DOS TRÊS SENSORES /////////////////////////////
 bool publicarMQTT()
 {
-    char mensagem[150];
+    // Buffer para armazenar o JSON dos três sensores
+    char mensagem[300];
 
-    snprintf(mensagem, sizeof(mensagem),
-        "{\"dispositivo\":\"esp32\",\"projeto\":\"ocupacao\",\"leituras\":{\"distancia_cm\":%.2f,\"ocupado\":%d}}",
-        distanciaFiltrada,
-        ocupado ? 1 : 0);
+    // Montagem da mensagem JSON
+    int tamanho = snprintf(mensagem, sizeof(mensagem),
+        "{\"dispositivo\":\"esp32\",\"projeto\":\"ocupacao\",\"sensores\":{"
+        "\"sensor1\":{\"distancia_cm\":%.2f,\"ocupado\":%d},"
+        "\"sensor2\":{\"distancia_cm\":%.2f,\"ocupado\":%d},"
+        "\"sensor3\":{\"distancia_cm\":%.2f,\"ocupado\":%d}"
+        "}}",
+        sensor1.distanciaFiltrada, sensor1.ocupado ? 1 : 0,
+        sensor2.distanciaFiltrada, sensor2.ocupado ? 1 : 0,
+        sensor3.distanciaFiltrada, sensor3.ocupado ? 1 : 0
+    );
 
+    // Verifica se o JSON foi montado corretamente
+    if (tamanho < 0 || tamanho >= sizeof(mensagem))
+    {
+        Serial.println("Erro ao montar mensagem JSON!");
+        return false;
+    }
+
+    // Verifica a conexão MQTT
     if (mqttClient.connected())
     {
         if (mqttClient.publish(topicoDados, mensagem))
         {
-            Serial.println("Dados publicados com sucesso!");
+            Serial.println("Dados dos tres sensores publicados com sucesso!");
             return true;
         }
         else
@@ -290,9 +357,17 @@ void setup()
 {
     Serial.begin(115200);
 
-    // Configuração dos pinos
-    pinMode(TRIG, OUTPUT);
-    pinMode(ECHO, INPUT);
+// Configuração dos três sensores
+configurarSensores();
+
+pinMode(sensor1.trig, OUTPUT);
+pinMode(sensor1.echo, INPUT);
+
+pinMode(sensor2.trig, OUTPUT);
+pinMode(sensor2.echo, INPUT);
+
+pinMode(sensor3.trig, OUTPUT);
+pinMode(sensor3.echo, INPUT);
 
     // Conexão Wi-Fi
     conectarWiFi();
@@ -337,10 +412,33 @@ void loop()
         }
     }
 
-    // Leitura do sensor a cada 500 ms
-    if (millis() - ultimaLeitura >= 500)
+
+// Leitura sequencial dos três sensores
+if (millis() - ultimaLeitura >= intervaloLeituraSensor)
+{
+    ultimaLeitura = millis();
+
+    switch (proximoSensor)
     {
-        ultimaLeitura = millis();
-        lerDistancia();
+        case 0:
+            lerDistancia(sensor1);
+            break;
+
+        case 1:
+            lerDistancia(sensor2);
+            break;
+
+        case 2:
+            lerDistancia(sensor3);
+            break;
     }
+
+    // Avança para o próximo sensor
+    proximoSensor++;
+
+    if (proximoSensor >= 3)
+    {
+        proximoSensor = 0;
+    }
+}
 }
